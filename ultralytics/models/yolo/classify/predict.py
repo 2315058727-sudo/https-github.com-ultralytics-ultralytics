@@ -52,16 +52,22 @@ class ClassificationPredictor(BasePredictor):
 
     def setup_source(self, source):
         """Set up source and inference mode and classify transforms."""
+        import torchvision.transforms as T
+
         super().setup_source(source)
         transforms = getattr(self.model.model, "transforms", None)  # missing on YAML-built and legacy checkpoints
         size = getattr(transforms.transforms[0], "size", max(self.imgsz)) if transforms is not None else None
         self.transforms = (
             transforms if size == max(self.imgsz) and self.model.format == "pt" else classify_transforms(self.imgsz)
         )
+        self.tensor_transforms = T.Compose([t for t in self.transforms.transforms if not isinstance(t, T.ToTensor)])
 
     def preprocess(self, img):
         """Convert input images to model-compatible tensor format with appropriate normalization."""
-        if not isinstance(img, torch.Tensor):
+        if isinstance(img, torch.Tensor):
+            if self.args.preprocess_tensor:  # raw (B, C, H, W) tensor at original resolution
+                img = self.tensor_transforms(img)
+        else:
             img = torch.stack(
                 [self.transforms(Image.fromarray(cv2.cvtColor(im, cv2.COLOR_BGR2RGB))) for im in img], dim=0
             )
