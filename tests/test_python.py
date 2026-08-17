@@ -17,7 +17,7 @@ import torch
 from PIL import Image
 
 import ultralytics.data.build as data_build
-from tests import CFG, MODEL, MODELS, SOURCE, SOURCES_LIST, TASK_MODEL_DATA
+from tests import CFG, MODEL, MODELS, MONO_TASK_MODEL_DATA, SOURCE, SOURCES_LIST, TASK_MODEL_DATA
 from ultralytics import RTDETR, YOLO
 from ultralytics.cfg import get_cfg
 from ultralytics.data.build import build_dataloader, load_inference_source
@@ -1886,9 +1886,14 @@ def test_multichannel():
     model.export(format="onnx")
 
 
-@pytest.mark.parametrize("task,model,data", TASK_MODEL_DATA)
+@pytest.mark.parametrize("task,model,data", MONO_TASK_MODEL_DATA)
 def test_grayscale(task: str, model: str, data: str, tmp_path) -> None:
-    """Test YOLO model grayscale training, validation, and prediction functionality."""
+    """Test YOLO model grayscale training, validation, and prediction functionality.
+
+    Mono-source: this predicts on a single-channel array, so paired-source tasks are excluded. Grayscale is meaningless
+    for them anyway — s3d stacks left and right RGB into one 6-channel input, and forcing `channels=1` onto a stereo
+    dataset describes an input the siamese backbone cannot split.
+    """
     if IS_RASPBERRYPI and task == "semantic":
         skip_rpi_semantic()
     if task in {"classify", "depth"}:  # grayscale not supported for classification or depth tasks
@@ -1919,3 +1924,68 @@ def test_semantic_polygon_data():
     model = YOLO("yolo26n-sem.pt")
     model.train(data="coco8-seg.yaml", epochs=1, imgsz=32, close_mosaic=1)
     model.val(data="coco8-seg.yaml")
+
+
+def test_nan_recovery_flag_before_first_validation(monkeypatch):
+    """Test the DDP NaN-recovery flag is int-able before any validation has set best_fitness.
+
+    Under DDP the flag is broadcast as int(corrupted); an epoch that skips validation (val_period > 1, or val=False)
+    leaves best_fitness unset, which used to make the fitness-collapse chain return None and raise TypeError at the end
+    of epoch 1.
+    """
+    from ultralytics.engine import trainer as trainer_mod
+    from ultralytics.models.yolo.detect import DetectionTrainer
+
+    t = object.__new__(DetectionTrainer)
+    t.loss, t.fitness, t.best_fitness = torch.tensor(1.0), None, None
+    t.device, t.start_epoch, t.nan_recovery_attempts = torch.device("cpu"), 0, 0
+    monkeypatch.setattr(trainer_mod, "RANK", 0)
+    monkeypatch.setattr(trainer_mod.dist, "broadcast", lambda *args, **kwargs: None)
+    assert t._handle_nan_recovery(0) is False
+
+
+def test_unvalidated_epoch_does_not_retrigger_collapse_recovery(monkeypatch):
+    """A zero fitness must never trigger recovery, and an epoch that skipped validation must not either.
+
+    Zero is a legitimate fitness on a small validation set: an s3d screening split of 189 frames returns AP3D 0.0 at
+    some early validations, which killed 1 arm in 8 per launch. Upstream removed the fitness-collapse trigger outright,
+    so a zero fitness is now simply survivable.
+
+    With `val_period > 1` most epochs never recompute fitness. `train()` resets `self.fitness` to None at the top of
+    each epoch so a NaN validation cannot re-fire on the same stale value every epoch after, spending a retry each time
+    and reporting "NaN persisted" though nothing recomputed it.
+    """
+    from ultralytics.engine import trainer as trainer_mod
+    from ultralytics.models.yolo.detect import DetectionTrainer
+
+    def make():
+        t = object.__new__(DetectionTrainer)
+        t.loss, t.fitness, t.best_fitness = torch.tensor(1.0), 0.0, 0.5  # collapsed-looking but finite
+        t.device, t.start_epoch, t.nan_recovery_attempts = torch.device("cpu"), 0, 0
+        t.last = Path("nonexistent-last.pt")
+        return t
+
+    monkeypatch.setattr(trainer_mod, "RANK", -1)
+
+    # A zero fitness after a positive best is healthy: it is no longer a recovery trigger.
+    t = make()
+    assert t._handle_nan_recovery(5) is False
+    assert t.nan_recovery_attempts == 0, "a zero fitness must not consume a recovery attempt"
+
+    # An epoch that skipped validation carries fitness None: ignored, and must not consume a retry.
+    t = make()
+    t.fitness = None
+    assert t._handle_nan_recovery(5) is False
+    assert t.nan_recovery_attempts == 0, "an unvalidated epoch must not consume a recovery attempt"
+
+    # A NaN fitness from an epoch that did validate is detected.
+    t = make()
+    t.fitness = float("nan")
+    with pytest.raises(RuntimeError, match=r"no valid last\.pt"):
+        t._handle_nan_recovery(5)
+
+    # A real NaN loss is detected even on an unvalidated epoch, since self.loss updates every epoch.
+    t = make()
+    t.loss, t.fitness = torch.tensor(float("nan")), None
+    with pytest.raises(RuntimeError, match=r"no valid last\.pt"):
+        t._handle_nan_recovery(5)
