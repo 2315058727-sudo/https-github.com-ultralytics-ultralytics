@@ -269,11 +269,22 @@ def _get_environment_info():
 
 
 def _get_project_name(trainer):
-    """Get slugified project and name from trainer args."""
+    """Get slugified project and name from trainer args, project None when it is a local directory path."""
     raw = str(trainer.args.project)
-    parts = raw.split("/", 1)
-    project = f"{parts[0]}/{slugify(parts[1])}" if len(parts) == 2 else slugify(raw)
-    return project, slugify(str(trainer.args.name or "train"))
+    owner, sep, project = raw.partition("/")
+    name = slugify(str(trainer.args.name or "train"))
+    if not sep and "\\" not in raw:
+        return slugify(raw), name  # bare project name, owner resolved from the API key
+    # An owner is a 4-32 character username slug, so a second separator, a backslash, or any non-slug or
+    # out-of-range owner means a directory path
+    valid = (
+        bool(owner and slugify(project))
+        and 4 <= len(owner) <= 32
+        and "\\" not in raw
+        and "/" not in project
+        and re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", owner)
+    )
+    return (f"{owner}/{slugify(project)}" if valid else None), name
 
 
 def on_pretrain_routine_start(trainer):
@@ -286,6 +297,12 @@ def on_pretrain_routine_start(trainer):
         return
 
     project, name = _get_project_name(trainer)
+    if not project:
+        LOGGER.info(
+            f"{PREFIX}project='{trainer.args.project}' is a local path, not an 'owner/project' Platform ID. "
+            f"Training will not be tracked on Platform."
+        )
+        return
     LOGGER.info(f"{PREFIX}Streaming training metrics to Platform")
 
     from ultralytics.utils.logger import ConsoleLogger
